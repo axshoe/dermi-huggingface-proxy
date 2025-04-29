@@ -20,6 +20,7 @@ app.get('/', (req, res) => {
 // Global variables to track model loading status
 let modelLoadingInProgress = false;
 let lastModelLoadAttempt = 0;
+// Add a flag to track if model has been successfully loaded at least once
 let modelSuccessfullyLoaded = false;
 
 // Implement a basic rate limiter
@@ -90,7 +91,7 @@ async function callHuggingFaceAPI(inputs) {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 60000 // Extend timeout to 60 seconds for model loading
+                timeout: 30000 // 30 second timeout (more reasonable)
             }
         );
 
@@ -100,15 +101,15 @@ async function callHuggingFaceAPI(inputs) {
         return response.data;
     } catch (error) {
         // Handle model loading errors
-        if (error.response && error.response.status === 503) {
-            console.log('Model loading in progress at Hugging Face:', error.response.data);
+        if (error.response && error.response.data &&
+            error.response.data.error &&
+            (error.response.data.error.includes('loading') ||
+                error.response.data.error.includes('currently loading'))) {
+
+            console.log('Model loading in progress at Hugging Face');
             modelLoadingInProgress = true;
             lastModelLoadAttempt = Date.now();
-            throw {
-                code: 'MODEL_LOADING',
-                message: error.response.data.error || 'Model is currently loading',
-                status: 503
-            };
+            throw { code: 'MODEL_LOADING', message: error.response.data.error };
         }
 
         // For any other error, log it and rethrow
@@ -140,8 +141,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         // Check if we need to wait because a model loading is in progress
         const now = Date.now();
         if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 20000) {
-            console.log('Model is still loading, returning 202 Accepted status');
-            return res.status(202).json({
+            return res.status(503).json({
                 error: 'Model loading in progress',
                 message: 'The AI model is currently loading. Please try again in a moment.',
                 retry: true
@@ -153,16 +153,31 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
             modelLoadingInProgress = false;
         }
 
+        // If the model has never been successfully loaded, we might need a "warm-up" call
+        if (!modelSuccessfullyLoaded) {
+            try {
+                // Make a simple warming request to load the model
+                console.log('Attempting model warm-up');
+                await callHuggingFaceAPI('Hello');
+                console.log('Model warm-up successful');
+            } catch (warmupError) {
+                // If it's a loading error, we can continue with the actual request
+                // Otherwise, we'll handle the error below
+                if (warmupError.code !== 'MODEL_LOADING') {
+                    throw warmupError;
+                }
+            }
+        }
+
         // Make the actual request to Hugging Face API
         try {
             const data = await callHuggingFaceAPI(inputs);
-            return res.json(data);
+            res.json(data);
         } catch (apiError) {
             if (apiError.code === 'MODEL_LOADING') {
-                console.log('Returning 202 status for model loading');
-                return res.status(202).json({
+                return res.status(503).json({
                     error: 'Model loading',
-                    message: 'The AI model is warming up. Please try again in a moment.',
+                    message: 'The AI model is still warming up. Please try again in a moment.',
                     retry: true
                 });
             }
@@ -180,7 +195,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         }
 
     } catch (error) {
-        console.error('Unhandled error:', error);
+        console.error('Unhandled error:', error.message);
 
         // Generic error handler
         res.status(error.response?.status || 500).json({
@@ -193,7 +208,6 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 // Add a pre-warming endpoint that can be called by a scheduler
 app.get('/api/warmup', async (req, res) => {
     try {
-        console.log('Warmup request received');
         await callHuggingFaceAPI('Hello, I am warming up the model.');
         res.json({ status: 'success', message: 'Model warmed up successfully' });
     } catch (error) {
@@ -222,22 +236,6 @@ setInterval(() => {
     });
 }, RATE_LIMIT_WINDOW);
 
-// Add a continuous warm-up process
-function scheduleWarmup() {
-    console.log('Scheduling model warmup');
-    setTimeout(async () => {
-        try {
-            console.log('Attempting scheduled model warm-up');
-            await callHuggingFaceAPI('Hello, this is a warm-up message.');
-            console.log('Scheduled model warm-up successful');
-        } catch (error) {
-            console.log('Scheduled warm-up: model may still be loading');
-        }
-        // Schedule the next warmup
-        scheduleWarmup();
-    }, 15 * 60 * 1000); // Try warming up every 15 minutes
-}
-
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
 
@@ -247,11 +245,8 @@ app.listen(PORT, () => {
             console.log('Attempting initial model warm-up');
             await callHuggingFaceAPI('Hello, this is a warm-up message.');
             console.log('Initial model warm-up successful');
-            modelSuccessfullyLoaded = true;
         } catch (error) {
-            console.log('Initial model warm-up: model may still be loading');
+            console.log('Initial model warm-up request acknowledged, model may still be loading');
         }
-        // Start the continuous warmup process
-        scheduleWarmup();
     }, 2000); // Wait 2 seconds after startup before warming up
 });
