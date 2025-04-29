@@ -23,6 +23,9 @@ let lastModelLoadAttempt = 0;
 // Add a flag to track if model has been successfully loaded at least once
 let modelSuccessfullyLoaded = false;
 
+// Define the model to use - USING A FASTER LOADING MODEL
+const MODEL_NAME = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'; // Much faster than phi-2
+
 // Implement a basic rate limiter
 const requestCounts = {};
 const RATE_LIMIT_WINDOW = 60000; // 1 minute in milliseconds
@@ -73,10 +76,10 @@ async function callHuggingFaceAPI(inputs) {
     }
 
     try {
-        console.log('Sending request to Hugging Face API');
+        console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
 
         const response = await axios.post(
-            'https://api-inference.huggingface.co/models/microsoft/phi-2',
+            `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
             {
                 inputs,
                 parameters: {
@@ -91,7 +94,7 @@ async function callHuggingFaceAPI(inputs) {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 30000 // 30 second timeout (more reasonable)
+                timeout: 20000 // 20 second timeout (faster model needs less time)
             }
         );
 
@@ -106,7 +109,7 @@ async function callHuggingFaceAPI(inputs) {
             (error.response.data.error.includes('loading') ||
                 error.response.data.error.includes('currently loading'))) {
 
-            console.log('Model loading in progress at Hugging Face');
+            console.log(`Model ${MODEL_NAME} loading in progress at Hugging Face`);
             modelLoadingInProgress = true;
             lastModelLoadAttempt = Date.now();
             throw { code: 'MODEL_LOADING', message: error.response.data.error };
@@ -140,16 +143,16 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 
         // Check if we need to wait because a model loading is in progress
         const now = Date.now();
-        if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 20000) {
+        if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 10000) { // Reduced wait time for faster model
             return res.status(503).json({
                 error: 'Model loading in progress',
-                message: 'The AI model is currently loading. Please try again in a moment.',
+                message: `The AI model ${MODEL_NAME} is currently loading. Please try again in a moment.`,
                 retry: true
             });
         }
 
         // Reset the model loading flag if it's been a while since the last attempt
-        if (modelLoadingInProgress && (now - lastModelLoadAttempt) >= 20000) {
+        if (modelLoadingInProgress && (now - lastModelLoadAttempt) >= 10000) {
             modelLoadingInProgress = false;
         }
 
@@ -177,7 +180,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
             if (apiError.code === 'MODEL_LOADING') {
                 return res.status(503).json({
                     error: 'Model loading',
-                    message: 'The AI model is still warming up. Please try again in a moment.',
+                    message: `The AI model ${MODEL_NAME} is still warming up. Please try again in a moment.`,
                     retry: true
                 });
             }
@@ -209,12 +212,12 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 app.get('/api/warmup', async (req, res) => {
     try {
         await callHuggingFaceAPI('Hello, I am warming up the model.');
-        res.json({ status: 'success', message: 'Model warmed up successfully' });
+        res.json({ status: 'success', message: `Model ${MODEL_NAME} warmed up successfully` });
     } catch (error) {
         if (error.code === 'MODEL_LOADING') {
             res.status(202).json({
                 status: 'pending',
-                message: 'Model is loading, warm-up request acknowledged'
+                message: `Model ${MODEL_NAME} is loading, warm-up request acknowledged`
             });
         } else {
             res.status(500).json({
@@ -238,15 +241,23 @@ setInterval(() => {
 
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
+    console.log(`Using model: ${MODEL_NAME}`);
 
-    // Try warming up the model on startup
+    // Try warming up the model on startup with multiple retries
     setTimeout(async () => {
-        try {
-            console.log('Attempting initial model warm-up');
-            await callHuggingFaceAPI('Hello, this is a warm-up message.');
-            console.log('Initial model warm-up successful');
-        } catch (error) {
-            console.log('Initial model warm-up request acknowledged, model may still be loading');
+        console.log('Attempting initial model warm-up');
+        // Try up to 3 times with increasing delays
+        for (let i = 0; i < 3; i++) {
+            try {
+                await callHuggingFaceAPI('Hello, this is a warm-up message.');
+                console.log(`Initial model ${MODEL_NAME} warm-up successful!`);
+                break; // Exit loop on success
+            } catch (error) {
+                console.log(`Warm-up attempt ${i+1} failed, waiting before retrying...`);
+                if (i < 2) { // Don't wait after the last attempt
+                    await new Promise(resolve => setTimeout(resolve, 5000 * (i+1))); // Increasing wait
+                }
+            }
         }
     }, 2000); // Wait 2 seconds after startup before warming up
 });
