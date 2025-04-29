@@ -17,9 +17,10 @@ app.get('/', (req, res) => {
     res.json({ status: 'Dermi Hugging Face Proxy API is running' });
 });
 
-// Track model loading status
+// Global variables to track model loading status
 let modelLoadingInProgress = false;
 let lastModelLoadAttempt = 0;
+let modelSuccessfullyLoaded = false;
 
 // Implement a basic rate limiter
 const requestCounts = {};
@@ -61,6 +62,61 @@ function rateLimiter(req, res, next) {
     next();
 }
 
+// Hugging Face API calling function with better error handling
+async function callHuggingFaceAPI(inputs) {
+    const HUGGING_FACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
+
+    if (!HUGGING_FACE_API_KEY) {
+        console.error('Missing Hugging Face API key');
+        throw new Error('Server configuration error: Missing API key');
+    }
+
+    try {
+        console.log('Sending request to Hugging Face API');
+
+        const response = await axios.post(
+            'https://api-inference.huggingface.co/models/microsoft/phi-2',
+            {
+                inputs,
+                parameters: {
+                    max_new_tokens: 256,
+                    temperature: 0.7,
+                    top_p: 0.9,
+                    do_sample: true
+                }
+            },
+            {
+                headers: {
+                    'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 60000 // Extend timeout to 60 seconds for model loading
+            }
+        );
+
+        console.log('Received successful response from Hugging Face API');
+        modelLoadingInProgress = false;
+        modelSuccessfullyLoaded = true;
+        return response.data;
+    } catch (error) {
+        // Handle model loading errors
+        if (error.response && error.response.status === 503) {
+            console.log('Model loading in progress at Hugging Face:', error.response.data);
+            modelLoadingInProgress = true;
+            lastModelLoadAttempt = Date.now();
+            throw {
+                code: 'MODEL_LOADING',
+                message: error.response.data.error || 'Model is currently loading',
+                status: 503
+            };
+        }
+
+        // For any other error, log it and rethrow
+        console.error('Error from Hugging Face API:', error.message);
+        throw error;
+    }
+}
+
 // Apply rate limiter to the API endpoint
 app.post('/api/huggingface', rateLimiter, async (req, res) => {
     try {
@@ -84,66 +140,75 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         // Check if we need to wait because a model loading is in progress
         const now = Date.now();
         if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 20000) {
-            return res.status(503).json({
+            console.log('Model is still loading, returning 202 Accepted status');
+            return res.status(202).json({
                 error: 'Model loading in progress',
                 message: 'The AI model is currently loading. Please try again in a moment.',
                 retry: true
             });
         }
 
-        // Make request to Hugging Face API with increased timeout
-        console.log('Sending request to Hugging Face API');
-        const response = await axios.post(
-            'https://api-inference.huggingface.co/models/microsoft/phi-2',
-            { inputs, parameters: { max_new_tokens: 256 } }, // Limit output tokens
-            {
-                headers: {
-                    'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 60000 // 60 second timeout
+        // Reset the model loading flag if it's been a while since the last attempt
+        if (modelLoadingInProgress && (now - lastModelLoadAttempt) >= 20000) {
+            modelLoadingInProgress = false;
+        }
+
+        // Make the actual request to Hugging Face API
+        try {
+            const data = await callHuggingFaceAPI(inputs);
+            return res.json(data);
+        } catch (apiError) {
+            if (apiError.code === 'MODEL_LOADING') {
+                console.log('Returning 202 status for model loading');
+                return res.status(202).json({
+                    error: 'Model loading',
+                    message: 'The AI model is warming up. Please try again in a moment.',
+                    retry: true
+                });
             }
-        );
 
-        console.log('Received response from Hugging Face API');
-        // Reset model loading flag on successful response
-        modelLoadingInProgress = false;
+            // Handle timeouts specifically
+            if (apiError.code === 'ECONNABORTED') {
+                return res.status(504).json({
+                    error: 'Gateway Timeout',
+                    message: 'The request to the AI model timed out. Please try again with a shorter message.'
+                });
+            }
 
-        // Return the data from Hugging Face
-        res.json(response.data);
+            // For any other error
+            throw apiError;
+        }
 
     } catch (error) {
-        console.error('Error calling Hugging Face API:', error.message);
-
-        // Handle model loading errors (common with Hugging Face)
-        if (error.response && error.response.data &&
-            error.response.data.error &&
-            (error.response.data.error.includes('loading') ||
-                error.response.data.error.includes('currently loading'))) {
-
-            modelLoadingInProgress = true;
-            lastModelLoadAttempt = Date.now();
-
-            return res.status(503).json({
-                error: 'Model loading',
-                message: 'The AI model is still warming up. Please try again in a moment.',
-                retry: true
-            });
-        }
-
-        // Handle timeouts specifically
-        if (error.code === 'ECONNABORTED') {
-            return res.status(504).json({
-                error: 'Gateway Timeout',
-                message: 'The request to the AI model timed out. Please try again with a shorter message.'
-            });
-        }
+        console.error('Unhandled error:', error);
 
         // Generic error handler
         res.status(error.response?.status || 500).json({
             error: 'Failed to process request',
-            message: error.message
+            message: error.message || 'An unexpected error occurred'
         });
+    }
+});
+
+// Add a pre-warming endpoint that can be called by a scheduler
+app.get('/api/warmup', async (req, res) => {
+    try {
+        console.log('Warmup request received');
+        await callHuggingFaceAPI('Hello, I am warming up the model.');
+        res.json({ status: 'success', message: 'Model warmed up successfully' });
+    } catch (error) {
+        if (error.code === 'MODEL_LOADING') {
+            res.status(202).json({
+                status: 'pending',
+                message: 'Model is loading, warm-up request acknowledged'
+            });
+        } else {
+            res.status(500).json({
+                status: 'error',
+                message: 'Failed to warm up model',
+                error: error.message
+            });
+        }
     }
 });
 
@@ -157,6 +222,36 @@ setInterval(() => {
     });
 }, RATE_LIMIT_WINDOW);
 
+// Add a continuous warm-up process
+function scheduleWarmup() {
+    console.log('Scheduling model warmup');
+    setTimeout(async () => {
+        try {
+            console.log('Attempting scheduled model warm-up');
+            await callHuggingFaceAPI('Hello, this is a warm-up message.');
+            console.log('Scheduled model warm-up successful');
+        } catch (error) {
+            console.log('Scheduled warm-up: model may still be loading');
+        }
+        // Schedule the next warmup
+        scheduleWarmup();
+    }, 15 * 60 * 1000); // Try warming up every 15 minutes
+}
+
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
+
+    // Try warming up the model on startup
+    setTimeout(async () => {
+        try {
+            console.log('Attempting initial model warm-up');
+            await callHuggingFaceAPI('Hello, this is a warm-up message.');
+            console.log('Initial model warm-up successful');
+            modelSuccessfullyLoaded = true;
+        } catch (error) {
+            console.log('Initial model warm-up: model may still be loading');
+        }
+        // Start the continuous warmup process
+        scheduleWarmup();
+    }, 2000); // Wait 2 seconds after startup before warming up
 });
