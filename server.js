@@ -77,6 +77,7 @@ async function callHuggingFaceAPI(inputs) {
 
     try {
         console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
+        console.log(`Input length: ${inputs.length} characters`);
 
         const response = await axios.post(
             `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
@@ -94,15 +95,56 @@ async function callHuggingFaceAPI(inputs) {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 20000 // 20 second timeout (faster model needs less time)
+                timeout: 20000 // 20 second timeout
             }
         );
 
         console.log('Received successful response from Hugging Face API');
         modelLoadingInProgress = false;
         modelSuccessfullyLoaded = true;
-        return response.data;
+
+        // Parse the response based on its format
+        let generatedText = '';
+
+        // Log the response structure to debug
+        console.log('Response data type:', typeof response.data);
+        if (typeof response.data === 'object') {
+            console.log('Response data keys:', Object.keys(response.data));
+        }
+
+        if (Array.isArray(response.data)) {
+            // Some models return an array of responses
+            console.log('Response is an array of length:', response.data.length);
+            if (response.data.length > 0) {
+                generatedText = response.data[0].generated_text || '';
+            }
+        } else if (typeof response.data === 'object') {
+            // Some models return an object with generated_text
+            generatedText = response.data.generated_text || '';
+        } else if (typeof response.data === 'string') {
+            // Some models return just the string
+            generatedText = response.data;
+        }
+
+        // Handle any other possible response formats
+        if (!generatedText && response.data) {
+            // Convert any other format to string
+            generatedText = JSON.stringify(response.data);
+        }
+
+        // Always return an object with a generated_text property
+        // This ensures consistency for the frontend
+        return { generated_text: generatedText };
     } catch (error) {
+        // Enhanced error logging
+        console.error('Hugging Face API Error Details:', {
+            message: error.message,
+            code: error.code,
+            status: error.response?.status,
+            statusText: error.response?.statusText,
+            data: error.response?.data,
+        });
+
         // Handle model loading errors
         if (error.response && error.response.data &&
             error.response.data.error &&
@@ -115,8 +157,7 @@ async function callHuggingFaceAPI(inputs) {
             throw { code: 'MODEL_LOADING', message: error.response.data.error };
         }
 
-        // For any other error, log it and rethrow
-        console.error('Error from Hugging Face API:', error.message);
+        // For any other error, rethrow with additional context
         throw error;
     }
 }
@@ -124,9 +165,16 @@ async function callHuggingFaceAPI(inputs) {
 // Apply rate limiter to the API endpoint
 app.post('/api/huggingface', rateLimiter, async (req, res) => {
     try {
+        console.log('Received request to /api/huggingface', {
+            contentType: req.headers['content-type'],
+            bodySize: JSON.stringify(req.body).length,
+            hasInputs: !!req.body.inputs
+        });
+
         const { inputs } = req.body;
 
         if (!inputs) {
+            console.log('Missing inputs field in request body', req.body);
             return res.status(400).json({
                 error: 'Bad Request',
                 message: 'The "inputs" field is required'
@@ -143,7 +191,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 
         // Check if we need to wait because a model loading is in progress
         const now = Date.now();
-        if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 10000) { // Reduced wait time for faster model
+        if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 10000) {
             return res.status(503).json({
                 error: 'Model loading in progress',
                 message: `The AI model ${MODEL_NAME} is currently loading. Please try again in a moment.`,
@@ -164,6 +212,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
                 await callHuggingFaceAPI('Hello');
                 console.log('Model warm-up successful');
             } catch (warmupError) {
+                console.error('Warm-up error:', warmupError);
                 // If it's a loading error, we can continue with the actual request
                 // Otherwise, we'll handle the error below
                 if (warmupError.code !== 'MODEL_LOADING') {
@@ -175,7 +224,15 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         // Make the actual request to Hugging Face API
         try {
             const data = await callHuggingFaceAPI(inputs);
-            res.json(data);
+
+            // Ensure we're sending a consistent response format for the frontend
+            if (typeof data === 'string') {
+                // If the response is a string, wrap it in an object
+                res.json({ generated_text: data });
+            } else {
+                // Otherwise, just send the object as is (already handled by callHuggingFaceAPI)
+                res.json(data);
+            }
         } catch (apiError) {
             if (apiError.code === 'MODEL_LOADING') {
                 return res.status(503).json({
@@ -193,17 +250,24 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
                 });
             }
 
-            // For any other error
-            throw apiError;
+            // For any other error, return appropriate status code and error details
+            // Avoid using 424 status code as it's causing issues with the frontend
+            const statusCode = apiError.response?.status || 500;
+            res.status(statusCode).json({
+                error: 'Failed to process request',
+                message: apiError.message || 'An unexpected error occurred',
+                details: apiError.response?.data || null
+            });
         }
 
     } catch (error) {
-        console.error('Unhandled error:', error.message);
+        console.error('Unhandled error:', error);
 
-        // Generic error handler
-        res.status(error.response?.status || 500).json({
+        // Provide detailed error response but avoid using 424
+        res.status(500).json({
             error: 'Failed to process request',
-            message: error.message || 'An unexpected error occurred'
+            message: error.message || 'An unexpected error occurred',
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
         });
     }
 });
