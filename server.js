@@ -22,8 +22,8 @@ let modelLoadingInProgress = false;
 let lastModelLoadAttempt = 0;
 let modelSuccessfullyLoaded = false;
 
-// Define the model to use - UPGRADED TO A MORE RELIABLE MODEL
-const MODEL_NAME = 'mistralai/Mistral-7B-Instruct-v0.2'; // More powerful and stable than TinyLlama
+// Define the model to use - SWITCHED TO A MODEL THAT CAN AUTO-LOAD
+const MODEL_NAME = 'microsoft/phi-2'; // 2.7B model with great performance that fits under the 10GB limit
 
 // Implement a basic rate limiter
 const requestCounts = {};
@@ -65,24 +65,21 @@ function rateLimiter(req, res, next) {
     next();
 }
 
-// Format prompt for Mistral model
-function formatPromptForMistral(inputs) {
-    // Mistral uses a specific format for instructions
-    return `<s>[INST] ${inputs} [/INST]`;
+// Format prompt based on model type
+function formatPrompt(inputs) {
+    // Microsoft phi-2 uses a simple User/Assistant format
+    return `User: ${inputs}\nAssistant:`;
 }
 
-// Extract response from Mistral format
-function extractMistralResponse(response) {
-    // Try to extract text from Mistral's standard format
+// Extract response from model format
+function extractModelResponse(response) {
+    // Try to extract text from phi-2 format
     let cleanedResponse = response;
 
-    // Remove any instruction tags if present
-    cleanedResponse = cleanedResponse.replace(/<s>\[INST\].*?\[\/INST\]/gs, '');
-    cleanedResponse = cleanedResponse.replace(/<\/s>/g, '');
-
-    // Remove any trailing User: or Assistant: prefixes
+    // Remove any trailing User: prompt that might be in the response
     cleanedResponse = cleanedResponse.replace(/\nUser:.*$/s, '');
-    cleanedResponse = cleanedResponse.replace(/\nAssistant:.*$/s, '');
+
+    // Remove any Assistant: prefix if present
     cleanedResponse = cleanedResponse.replace(/^Assistant:\s*/i, '');
     cleanedResponse = cleanedResponse.replace(/^Dermi:\s*/i, '');
 
@@ -102,8 +99,8 @@ async function callHuggingFaceAPI(inputs) {
         console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
         console.log(`Input length: ${inputs.length} characters`);
 
-        // Format the input correctly for Mistral
-        const formattedInput = formatPromptForMistral(inputs);
+        // Format the input correctly for phi-2
+        const formattedInput = formatPrompt(inputs);
 
         const response = await axios.post(
             `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
@@ -158,7 +155,7 @@ async function callHuggingFaceAPI(inputs) {
         }
 
         // Now extract the actual response text
-        const generatedText = extractMistralResponse(rawResponse);
+        const generatedText = extractModelResponse(rawResponse);
 
         console.log('Extracted response:', generatedText.substring(0, 100) + '...');
 
