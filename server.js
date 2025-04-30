@@ -20,7 +20,6 @@ app.get('/', (req, res) => {
 // Global variables to track model loading status
 let modelLoadingInProgress = false;
 let lastModelLoadAttempt = 0;
-// Add a flag to track if model has been successfully loaded at least once
 let modelSuccessfullyLoaded = false;
 
 // Define the model to use - USING A FASTER LOADING MODEL
@@ -66,6 +65,35 @@ function rateLimiter(req, res, next) {
     next();
 }
 
+// Improved function to format TinyLlama inputs correctly
+function formatPromptForTinyLlama(inputs) {
+    // TinyLlama uses a specific format for chat
+    return `<|im_start|>system
+${inputs}
+<|im_end|>
+<|im_start|>assistant
+`;
+}
+
+// Extract response from TinyLlama format
+function extractTinyLlamaResponse(response) {
+    // Try to extract text from TinyLlama's standard format first
+    const assistantMatch = response.match(/<\|im_start\|>assistant\n([\s\S]*?)(?:<\|im_end\|>|$)/);
+    if (assistantMatch && assistantMatch[1]) {
+        return assistantMatch[1].trim();
+    }
+
+    // If we can't find the standard format, try to extract just the assistant response
+    // Look for Dermi: pattern as a fallback
+    const dermiMatch = response.match(/Dermi:([\s\S]*?)(?:\nUser:|$)/i);
+    if (dermiMatch && dermiMatch[1]) {
+        return dermiMatch[1].trim();
+    }
+
+    // Last resort - just return whatever is there, trimmed
+    return response.trim();
+}
+
 // Hugging Face API calling function with better error handling
 async function callHuggingFaceAPI(inputs) {
     const HUGGING_FACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
@@ -79,17 +107,19 @@ async function callHuggingFaceAPI(inputs) {
         console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
         console.log(`Input length: ${inputs.length} characters`);
 
-        // IMPORTANT CHANGE: Ensure we have reasonable generation parameters
+        // Format the input correctly for TinyLlama
+        const formattedInput = formatPromptForTinyLlama(inputs);
+
         const response = await axios.post(
             `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
             {
-                inputs,
+                inputs: formattedInput,
                 parameters: {
-                    max_new_tokens: 400,  // Increased from 200 to get more complete responses
+                    max_new_tokens: 400,
                     temperature: 0.7,
                     top_p: 0.9,
                     do_sample: true,
-                    return_full_text: false  // IMPORTANT: Only return the new text, not the prompt
+                    return_full_text: false  // Only return new text
                 }
             },
             {
@@ -97,12 +127,11 @@ async function callHuggingFaceAPI(inputs) {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 45000 // Increased to 45 seconds
+                timeout: 45000 // 45 seconds
             }
         );
 
         console.log('Received successful response from Hugging Face API');
-        // Log a sample of the response for debugging
         console.log('Response preview:',
             JSON.stringify(response.data).substring(0, 150) + '...');
 
@@ -110,36 +139,35 @@ async function callHuggingFaceAPI(inputs) {
         modelSuccessfullyLoaded = true;
 
         // Parse the response based on its format
-        let generatedText = '';
+        let rawResponse = '';
 
-        // Log the response structure to debug
         console.log('Response data type:', typeof response.data);
         if (typeof response.data === 'object') {
             console.log('Response data keys:', Object.keys(response.data));
         }
 
         if (Array.isArray(response.data)) {
-            // Some models return an array of responses
             console.log('Response is an array of length:', response.data.length);
             if (response.data.length > 0) {
-                generatedText = response.data[0].generated_text || '';
+                rawResponse = response.data[0].generated_text || '';
             }
         } else if (typeof response.data === 'object') {
-            // Some models return an object with generated_text
-            generatedText = response.data.generated_text || '';
+            rawResponse = response.data.generated_text || '';
         } else if (typeof response.data === 'string') {
-            // Some models return just the string
-            generatedText = response.data;
+            rawResponse = response.data;
         }
 
         // Handle any other possible response formats
-        if (!generatedText && response.data) {
-            // Convert any other format to string
-            generatedText = JSON.stringify(response.data);
+        if (!rawResponse && response.data) {
+            rawResponse = JSON.stringify(response.data);
         }
 
-        // Always return an object with a generated_text property
-        // This ensures consistency for the frontend
+        // Now extract the actual response text
+        const generatedText = extractTinyLlamaResponse(rawResponse);
+
+        console.log('Extracted response:', generatedText.substring(0, 100) + '...');
+
+        // Return in consistent format
         return { generated_text: generatedText };
     } catch (error) {
         // Enhanced error logging
@@ -223,12 +251,11 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
             try {
                 // Make a simple warming request to load the model
                 console.log('Attempting model warm-up');
-                await callHuggingFaceAPI('Hello');
+                await callHuggingFaceAPI('You are Dermi, a dermatology assistant. Keep responses brief.');
                 console.log('Model warm-up successful');
             } catch (warmupError) {
                 console.error('Warm-up error:', warmupError);
                 // If it's a loading error, we can continue with the actual request
-                // Otherwise, we'll handle the error below
                 if (warmupError.code !== 'MODEL_LOADING') {
                     throw warmupError;
                 }
@@ -244,7 +271,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
                 // If the response is a string, wrap it in an object
                 res.json({ generated_text: data });
             } else {
-                // Otherwise, just send the object as is (already handled by callHuggingFaceAPI)
+                // Otherwise, just send the object as is
                 res.json(data);
             }
         } catch (apiError) {
@@ -293,7 +320,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 // Add a pre-warming endpoint that can be called by a scheduler
 app.get('/api/warmup', async (req, res) => {
     try {
-        await callHuggingFaceAPI('Hello, I am warming up the model.');
+        await callHuggingFaceAPI('You are Dermi, a friendly dermatology assistant. Provide brief, helpful answers about skin health.');
         res.json({ status: 'success', message: `Model ${MODEL_NAME} warmed up successfully` });
     } catch (error) {
         if (error.code === 'MODEL_LOADING') {
@@ -331,7 +358,7 @@ app.listen(PORT, () => {
         // Try up to 3 times with increasing delays
         for (let i = 0; i < 3; i++) {
             try {
-                await callHuggingFaceAPI('Hello, this is a warm-up message.');
+                await callHuggingFaceAPI('You are Dermi, a dermatology assistant. Your job is to provide helpful information about skin health and the Dermi app. Keep responses brief and professional.');
                 console.log(`Initial model ${MODEL_NAME} warm-up successful!`);
                 break; // Exit loop on success
             } catch (error) {
