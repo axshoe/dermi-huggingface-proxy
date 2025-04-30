@@ -25,13 +25,15 @@ let modelLoadingInProgress = false;
 let lastModelLoadAttempt = 0;
 let modelSuccessfullyLoaded = false;
 let consecutiveFailures = 0;
-let CURRENT_MODEL = process.env.PRIMARY_MODEL || 'microsoft/phi-2';
+const MAX_CONSECUTIVE_FAILURES = 5;
+let serviceRecoveryAttempts = 0;
+let CURRENT_MODEL = process.env.PRIMARY_MODEL || 'facebook/opt-350m';
 
-// Define models in order of preference
+// Define models in order of preference - prioritizing reliable models first
 const MODELS = [
-    'microsoft/phi-2',           // Primary choice - 2.7B parameter model
+    'facebook/opt-350m',         // Primary choice - very small but very reliable
     'google/flan-t5-small',      // Fallback #1 - smaller but reliable
-    'facebook/opt-350m',         // Fallback #2 - very small but very reliable
+    'microsoft/phi-2',           // Fallback #2 - 2.7B parameter model but less reliable
     'distilbert/distilbert-base-uncased' // Last resort - not ideal for generation but should work
 ];
 
@@ -106,16 +108,18 @@ function extractModelResponse(response, modelName) {
     } else if (modelName.includes('flan-t5') || modelName.includes('opt')) {
         // These models typically return just the answer
         cleanedResponse = cleanedResponse.replace(/^A:\s*/i, '');
+        cleanedResponse = cleanedResponse.replace(/^Q:.*$/gm, ''); // Remove question reflections
     }
 
     return cleanedResponse.trim();
 }
 
-// Exponential backoff for retries
+// Improved exponential backoff for retries
 async function wait(attemptNumber) {
-    const baseDelay = 1000; // 1 second
+    const baseDelay = 2000; // 2 seconds (increased from 1)
     const maxDelay = 30000; // 30 seconds
     const delay = Math.min(baseDelay * Math.pow(2, attemptNumber), maxDelay);
+    console.log(`Waiting ${delay}ms before retry`);
     await new Promise(resolve => setTimeout(resolve, delay));
 }
 
@@ -153,6 +157,56 @@ function getModelParameters(modelName) {
             do_sample: true
         };
     }
+}
+
+// Service recovery function
+async function attemptServiceRecovery() {
+    if (serviceRecoveryAttempts > 3) {
+        console.log("Too many recovery attempts, pausing recovery for 5 minutes");
+        setTimeout(() => {
+            serviceRecoveryAttempts = 0;
+            attemptServiceRecovery();
+        }, 300000); // 5 minutes
+        return;
+    }
+
+    serviceRecoveryAttempts++;
+    console.log(`Recovery attempt ${serviceRecoveryAttempts}: Trying to warm up a model`);
+
+    // Try all models in sequence until one works
+    for (const modelName of MODELS) {
+        try {
+            console.log(`Trying to recover with model ${modelName}`);
+            const response = await axios.post(
+                `https://api-inference.huggingface.co/models/${modelName}`,
+                {
+                    inputs: "You are Dermi, a helpful assistant.",
+                    parameters: getModelParameters(modelName)
+                },
+                {
+                    headers: {
+                        'Authorization': `Bearer ${process.env.HUGGINGFACE_API_KEY}`,
+                        'Content-Type': 'application/json'
+                    },
+                    timeout: 15000
+                }
+            );
+
+            if (response.status === 200) {
+                console.log(`Recovery successful with model ${modelName}`);
+                CURRENT_MODEL = modelName;
+                modelSuccessfullyLoaded = true;
+                consecutiveFailures = 0;
+                serviceRecoveryAttempts = 0;
+                return true;
+            }
+        } catch (error) {
+            console.log(`Recovery attempt with ${modelName} failed: ${error.message}`);
+        }
+    }
+
+    console.log("All recovery attempts failed");
+    return false;
 }
 
 // Hugging Face API calling function with better error handling and fallback
@@ -224,6 +278,14 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         // Extract the actual response text
         const generatedText = extractModelResponse(rawResponse, modelName);
 
+        // Check if response is too short and provide a better response
+        if (generatedText.length < 20) {
+            return {
+                generated_text: "I'm here to help with skin health questions. Could you please ask about a specific skin condition or how to use the Dermi app?",
+                model_used: modelName
+            };
+        }
+
         // Return in consistent format
         return {
             generated_text: generatedText,
@@ -240,6 +302,12 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
 
         consecutiveFailures++;
 
+        // Check if we need to attempt service recovery
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            console.log(`${consecutiveFailures} consecutive failures detected, attempting service recovery`);
+            attemptServiceRecovery();
+        }
+
         // Handle model loading errors
         if (error.response?.status === 503 ||
             (error.response?.data?.error && error.response.data.error.includes('loading'))) {
@@ -248,22 +316,14 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
             modelLoadingInProgress = true;
             lastModelLoadAttempt = Date.now();
 
-            // If we've had too many failures with this model, try the next one
-            if (consecutiveFailures > 2) {
-                console.log(`Switching to next model after ${consecutiveFailures} failures`);
-                return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
-            }
+            // Wait longer between retries for 503 errors
+            await wait(attemptNumber + 1);
 
-            // If this is not the first attempt, wait with exponential backoff
-            if (attemptNumber > 0) {
-                await wait(attemptNumber);
-            }
-
-            // Retry with the same model (up to 3 times per model)
-            if (attemptNumber < 2) {
+            // Try more times before switching models
+            if (attemptNumber < 3) {
                 return callHuggingFaceAPI(inputs, attemptNumber + 1, modelIndex);
             } else {
-                // After 3 attempts, try the next model
+                // After multiple attempts, try the next model
                 return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
             }
         }
@@ -272,12 +332,14 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
             console.log(`Timeout with model ${modelName}`);
 
-            // Try the next model immediately on timeout
+            // Wait before trying the next model
+            await wait(0);
             return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
         }
 
         // For any other error, try the next model
         console.log(`Unhandled error with model ${modelName}, trying next model`);
+        await wait(0);
         return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
     }
 }
@@ -311,12 +373,14 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         } catch (apiError) {
             console.log('All models failed:', apiError.message);
 
-            // If all models failed, return a clear error
-            res.status(503).json({
-                error: 'Service Unavailable',
-                message: 'All AI models are currently unavailable. Please try again later.',
-                retry: true
+            // If all models failed, return a default response instead of error
+            res.json({
+                generated_text: "I'm having trouble connecting to my knowledge base, but I'm here to help with skin health questions. Could you try again in a few moments?",
+                model_used: "fallback_response"
             });
+
+            // Try recovery in background
+            attemptServiceRecovery();
         }
     } catch (error) {
         console.error('Unhandled error:', error);
@@ -381,6 +445,8 @@ app.listen(PORT, () => {
             console.log(`Initial model ${result.model_used} warm-up successful!`);
         } catch (error) {
             console.error('All warm-up attempts failed:', error.message);
+            // Attempt service recovery on startup failure
+            attemptServiceRecovery();
         }
     }, 2000); // Wait 2 seconds after startup before warming up
 });
