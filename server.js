@@ -79,12 +79,13 @@ async function callHuggingFaceAPI(inputs) {
         console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
         console.log(`Input length: ${inputs.length} characters`);
 
+        // Increase timeout to 30 seconds
         const response = await axios.post(
             `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
             {
                 inputs,
                 parameters: {
-                    max_new_tokens: 256,
+                    max_new_tokens: 200,  // Reduced from 256 to improve response time
                     temperature: 0.7,
                     top_p: 0.9,
                     do_sample: true
@@ -95,7 +96,7 @@ async function callHuggingFaceAPI(inputs) {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 20000 // 20 second timeout
+                timeout: 30000 // Increased from 20000 to 30000 (30 seconds)
             }
         );
 
@@ -157,6 +158,14 @@ async function callHuggingFaceAPI(inputs) {
             throw { code: 'MODEL_LOADING', message: error.response.data.error };
         }
 
+        // Special handling for timeouts with clear error code
+        if (error.code === 'ECONNABORTED') {
+            throw {
+                code: 'TIMEOUT',
+                message: 'Request to AI model timed out. Try a shorter message or try again later.'
+            };
+        }
+
         // For any other error, rethrow with additional context
         throw error;
     }
@@ -182,7 +191,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         }
 
         // Check input length to avoid token limit issues
-        if (inputs.length > 4000) {
+        if (inputs.length > 2500) { // Reduced from 4000 to improve reliability
             return res.status(400).json({
                 error: 'Input too long',
                 message: 'The input text exceeds the maximum allowed length'
@@ -234,6 +243,8 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
                 res.json(data);
             }
         } catch (apiError) {
+            console.log('API Error caught:', apiError.code, apiError.message);
+
             if (apiError.code === 'MODEL_LOADING') {
                 return res.status(503).json({
                     error: 'Model loading',
@@ -243,31 +254,33 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
             }
 
             // Handle timeouts specifically
-            if (apiError.code === 'ECONNABORTED') {
+            if (apiError.code === 'TIMEOUT' || apiError.code === 'ECONNABORTED') {
                 return res.status(504).json({
                     error: 'Gateway Timeout',
-                    message: 'The request to the AI model timed out. Please try again with a shorter message.'
+                    message: 'The request to the AI model timed out. Please try again with a shorter message.',
+                    retry: true
                 });
             }
 
             // For any other error, return appropriate status code and error details
-            // Avoid using 424 status code as it's causing issues with the frontend
             const statusCode = apiError.response?.status || 500;
             res.status(statusCode).json({
                 error: 'Failed to process request',
                 message: apiError.message || 'An unexpected error occurred',
-                details: apiError.response?.data || null
+                details: apiError.response?.data || null,
+                retry: true // Add retry flag to encourage client to retry
             });
         }
 
     } catch (error) {
         console.error('Unhandled error:', error);
 
-        // Provide detailed error response but avoid using 424
+        // Provide detailed error response
         res.status(500).json({
             error: 'Failed to process request',
             message: error.message || 'An unexpected error occurred',
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
+            retry: true // Add retry flag to encourage client to retry
         });
     }
 });
