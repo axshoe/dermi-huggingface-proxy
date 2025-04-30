@@ -79,16 +79,17 @@ async function callHuggingFaceAPI(inputs) {
         console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
         console.log(`Input length: ${inputs.length} characters`);
 
-        // Increase timeout to 30 seconds
+        // IMPORTANT CHANGE: Ensure we have reasonable generation parameters
         const response = await axios.post(
             `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
             {
                 inputs,
                 parameters: {
-                    max_new_tokens: 200,  // Reduced from 256 to improve response time
+                    max_new_tokens: 400,  // Increased from 200 to get more complete responses
                     temperature: 0.7,
                     top_p: 0.9,
-                    do_sample: true
+                    do_sample: true,
+                    return_full_text: false  // IMPORTANT: Only return the new text, not the prompt
                 }
             },
             {
@@ -96,11 +97,15 @@ async function callHuggingFaceAPI(inputs) {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 30000 // Increased from 20000 to 30000 (30 seconds)
+                timeout: 45000 // Increased to 45 seconds
             }
         );
 
         console.log('Received successful response from Hugging Face API');
+        // Log a sample of the response for debugging
+        console.log('Response preview:',
+            JSON.stringify(response.data).substring(0, 150) + '...');
+
         modelLoadingInProgress = false;
         modelSuccessfullyLoaded = true;
 
