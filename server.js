@@ -22,8 +22,8 @@ let modelLoadingInProgress = false;
 let lastModelLoadAttempt = 0;
 let modelSuccessfullyLoaded = false;
 
-// Define the model to use - USING A FASTER LOADING MODEL
-const MODEL_NAME = 'TinyLlama/TinyLlama-1.1B-Chat-v1.0'; // Much faster than phi-2
+// Define the model to use - UPGRADED TO A MORE RELIABLE MODEL
+const MODEL_NAME = 'mistralai/Mistral-7B-Instruct-v0.2'; // More powerful and stable than TinyLlama
 
 // Implement a basic rate limiter
 const requestCounts = {};
@@ -65,33 +65,28 @@ function rateLimiter(req, res, next) {
     next();
 }
 
-// Improved function to format TinyLlama inputs correctly
-function formatPromptForTinyLlama(inputs) {
-    // TinyLlama uses a specific format for chat
-    return `<|im_start|>system
-${inputs}
-<|im_end|>
-<|im_start|>assistant
-`;
+// Format prompt for Mistral model
+function formatPromptForMistral(inputs) {
+    // Mistral uses a specific format for instructions
+    return `<s>[INST] ${inputs} [/INST]`;
 }
 
-// Extract response from TinyLlama format
-function extractTinyLlamaResponse(response) {
-    // Try to extract text from TinyLlama's standard format first
-    const assistantMatch = response.match(/<\|im_start\|>assistant\n([\s\S]*?)(?:<\|im_end\|>|$)/);
-    if (assistantMatch && assistantMatch[1]) {
-        return assistantMatch[1].trim();
-    }
+// Extract response from Mistral format
+function extractMistralResponse(response) {
+    // Try to extract text from Mistral's standard format
+    let cleanedResponse = response;
 
-    // If we can't find the standard format, try to extract just the assistant response
-    // Look for Dermi: pattern as a fallback
-    const dermiMatch = response.match(/Dermi:([\s\S]*?)(?:\nUser:|$)/i);
-    if (dermiMatch && dermiMatch[1]) {
-        return dermiMatch[1].trim();
-    }
+    // Remove any instruction tags if present
+    cleanedResponse = cleanedResponse.replace(/<s>\[INST\].*?\[\/INST\]/gs, '');
+    cleanedResponse = cleanedResponse.replace(/<\/s>/g, '');
 
-    // Last resort - just return whatever is there, trimmed
-    return response.trim();
+    // Remove any trailing User: or Assistant: prefixes
+    cleanedResponse = cleanedResponse.replace(/\nUser:.*$/s, '');
+    cleanedResponse = cleanedResponse.replace(/\nAssistant:.*$/s, '');
+    cleanedResponse = cleanedResponse.replace(/^Assistant:\s*/i, '');
+    cleanedResponse = cleanedResponse.replace(/^Dermi:\s*/i, '');
+
+    return cleanedResponse.trim();
 }
 
 // Hugging Face API calling function with better error handling
@@ -107,19 +102,19 @@ async function callHuggingFaceAPI(inputs) {
         console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
         console.log(`Input length: ${inputs.length} characters`);
 
-        // Format the input correctly for TinyLlama
-        const formattedInput = formatPromptForTinyLlama(inputs);
+        // Format the input correctly for Mistral
+        const formattedInput = formatPromptForMistral(inputs);
 
         const response = await axios.post(
             `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
             {
                 inputs: formattedInput,
                 parameters: {
-                    max_new_tokens: 400,
-                    temperature: 0.7,
-                    top_p: 0.9,
+                    max_new_tokens: 250,       // Limit response length for faster replies
+                    temperature: 0.5,          // More deterministic for medical info
+                    top_p: 0.95,               // Slightly increased for better quality
                     do_sample: true,
-                    return_full_text: false  // Only return new text
+                    return_full_text: false    // Only return new text
                 }
             },
             {
@@ -127,7 +122,7 @@ async function callHuggingFaceAPI(inputs) {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 45000 // 45 seconds
+                timeout: 60000 // 60 seconds - increased for larger model
             }
         );
 
@@ -163,7 +158,7 @@ async function callHuggingFaceAPI(inputs) {
         }
 
         // Now extract the actual response text
-        const generatedText = extractTinyLlamaResponse(rawResponse);
+        const generatedText = extractMistralResponse(rawResponse);
 
         console.log('Extracted response:', generatedText.substring(0, 100) + '...');
 
@@ -189,6 +184,15 @@ async function callHuggingFaceAPI(inputs) {
             modelLoadingInProgress = true;
             lastModelLoadAttempt = Date.now();
             throw { code: 'MODEL_LOADING', message: error.response.data.error };
+        }
+
+        // Handle 424 Failed Dependency errors (what you were seeing)
+        if (error.response && error.response.status === 424) {
+            console.log('Received 424 Failed Dependency error - likely input formatting issue');
+            throw {
+                code: 'INPUT_ERROR',
+                message: 'There was an issue processing your request. Try a simpler question.'
+            };
         }
 
         // Special handling for timeouts with clear error code
@@ -224,7 +228,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         }
 
         // Check input length to avoid token limit issues
-        if (inputs.length > 2500) { // Reduced from 4000 to improve reliability
+        if (inputs.length > 2000) { // Reduced from 2500 to improve reliability
             return res.status(400).json({
                 error: 'Input too long',
                 message: 'The input text exceeds the maximum allowed length'
@@ -233,7 +237,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 
         // Check if we need to wait because a model loading is in progress
         const now = Date.now();
-        if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 10000) {
+        if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 15000) {
             return res.status(503).json({
                 error: 'Model loading in progress',
                 message: `The AI model ${MODEL_NAME} is currently loading. Please try again in a moment.`,
@@ -242,7 +246,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         }
 
         // Reset the model loading flag if it's been a while since the last attempt
-        if (modelLoadingInProgress && (now - lastModelLoadAttempt) >= 10000) {
+        if (modelLoadingInProgress && (now - lastModelLoadAttempt) >= 15000) {
             modelLoadingInProgress = false;
         }
 
@@ -281,6 +285,14 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
                 return res.status(503).json({
                     error: 'Model loading',
                     message: `The AI model ${MODEL_NAME} is still warming up. Please try again in a moment.`,
+                    retry: true
+                });
+            }
+
+            if (apiError.code === 'INPUT_ERROR') {
+                return res.status(400).json({
+                    error: 'Input processing error',
+                    message: apiError.message,
                     retry: true
                 });
             }
