@@ -4,7 +4,7 @@ const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
 // Enable CORS for all routes
 app.use(cors());
@@ -14,16 +14,26 @@ app.use(express.json({ limit: '1mb' })); // Increase limit for larger prompts
 
 // Simple health check endpoint
 app.get('/', (req, res) => {
-    res.json({ status: 'Dermi Hugging Face Proxy API is running' });
+    res.json({
+        status: 'Dermi Hugging Face Proxy API is running',
+        currentModel: CURRENT_MODEL
+    });
 });
 
 // Global variables to track model loading status
 let modelLoadingInProgress = false;
 let lastModelLoadAttempt = 0;
 let modelSuccessfullyLoaded = false;
+let consecutiveFailures = 0;
+let CURRENT_MODEL = process.env.PRIMARY_MODEL || 'microsoft/phi-2';
 
-// Define the model to use - SWITCHED TO A MODEL THAT CAN AUTO-LOAD
-const MODEL_NAME = 'microsoft/phi-2'; // 2.7B model with great performance that fits under the 10GB limit
+// Define models in order of preference
+const MODELS = [
+    'microsoft/phi-2',           // Primary choice - 2.7B parameter model
+    'google/flan-t5-small',      // Fallback #1 - smaller but reliable
+    'facebook/opt-350m',         // Fallback #2 - very small but very reliable
+    'distilbert/distilbert-base-uncased' // Last resort - not ideal for generation but should work
+];
 
 // Implement a basic rate limiter
 const requestCounts = {};
@@ -66,28 +76,87 @@ function rateLimiter(req, res, next) {
 }
 
 // Format prompt based on model type
-function formatPrompt(inputs) {
-    // Microsoft phi-2 uses a simple User/Assistant format
-    return `User: ${inputs}\nAssistant:`;
+function formatPrompt(inputs, modelName) {
+    // Different models may require different prompting formats
+    if (modelName.includes('phi-2')) {
+        // Microsoft phi-2 uses a simple User/Assistant format
+        return `User: ${inputs}\nAssistant:`;
+    } else if (modelName.includes('flan-t5')) {
+        // T5 models work well with task prefixes
+        return `Answer this medical question: ${inputs}`;
+    } else if (modelName.includes('opt')) {
+        // OPT models work with simple prompts
+        return `Q: ${inputs}\nA:`;
+    } else {
+        // Default format
+        return inputs;
+    }
 }
 
 // Extract response from model format
-function extractModelResponse(response) {
-    // Try to extract text from phi-2 format
+function extractModelResponse(response, modelName) {
+    // Handle different model output formats
     let cleanedResponse = response;
 
-    // Remove any trailing User: prompt that might be in the response
-    cleanedResponse = cleanedResponse.replace(/\nUser:.*$/s, '');
-
-    // Remove any Assistant: prefix if present
-    cleanedResponse = cleanedResponse.replace(/^Assistant:\s*/i, '');
-    cleanedResponse = cleanedResponse.replace(/^Dermi:\s*/i, '');
+    if (modelName.includes('phi-2')) {
+        // Clean up phi-2 responses
+        cleanedResponse = cleanedResponse.replace(/\nUser:.*$/s, '');
+        cleanedResponse = cleanedResponse.replace(/^Assistant:\s*/i, '');
+        cleanedResponse = cleanedResponse.replace(/^Dermi:\s*/i, '');
+    } else if (modelName.includes('flan-t5') || modelName.includes('opt')) {
+        // These models typically return just the answer
+        cleanedResponse = cleanedResponse.replace(/^A:\s*/i, '');
+    }
 
     return cleanedResponse.trim();
 }
 
-// Hugging Face API calling function with better error handling
-async function callHuggingFaceAPI(inputs) {
+// Exponential backoff for retries
+async function wait(attemptNumber) {
+    const baseDelay = 1000; // 1 second
+    const maxDelay = 30000; // 30 seconds
+    const delay = Math.min(baseDelay * Math.pow(2, attemptNumber), maxDelay);
+    await new Promise(resolve => setTimeout(resolve, delay));
+}
+
+// Get model parameters based on model name
+function getModelParameters(modelName) {
+    if (modelName.includes('phi-2')) {
+        return {
+            max_new_tokens: 250,
+            temperature: 0.5,
+            top_p: 0.95,
+            do_sample: true,
+            return_full_text: false
+        };
+    } else if (modelName.includes('flan-t5')) {
+        return {
+            max_new_tokens: 150,
+            temperature: 0.7,
+            top_p: 0.9,
+            do_sample: true
+        };
+    } else if (modelName.includes('opt')) {
+        return {
+            max_new_tokens: 100,
+            temperature: 0.6,
+            top_p: 0.9,
+            do_sample: true,
+            return_full_text: false
+        };
+    } else {
+        // Default parameters for other models
+        return {
+            max_new_tokens: 100,
+            temperature: 0.7,
+            top_p: 0.9,
+            do_sample: true
+        };
+    }
+}
+
+// Hugging Face API calling function with better error handling and fallback
+async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
     const HUGGING_FACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
 
     if (!HUGGING_FACE_API_KEY) {
@@ -95,51 +164,49 @@ async function callHuggingFaceAPI(inputs) {
         throw new Error('Server configuration error: Missing API key');
     }
 
+    // Get the model to try
+    if (modelIndex >= MODELS.length) {
+        throw new Error('All models failed, unable to process request');
+    }
+
+    const modelName = MODELS[modelIndex];
+    CURRENT_MODEL = modelName;
+
     try {
-        console.log(`Sending request to Hugging Face API for model: ${MODEL_NAME}`);
+        console.log(`Attempt ${attemptNumber + 1} with model ${modelName}`);
         console.log(`Input length: ${inputs.length} characters`);
 
-        // Format the input correctly for phi-2
-        const formattedInput = formatPrompt(inputs);
+        // Format the input correctly for the chosen model
+        const formattedInput = formatPrompt(inputs, modelName);
+        const parameters = getModelParameters(modelName);
 
         const response = await axios.post(
-            `https://api-inference.huggingface.co/models/${MODEL_NAME}`,
+            `https://api-inference.huggingface.co/models/${modelName}`,
             {
                 inputs: formattedInput,
-                parameters: {
-                    max_new_tokens: 250,       // Limit response length for faster replies
-                    temperature: 0.5,          // More deterministic for medical info
-                    top_p: 0.95,               // Slightly increased for better quality
-                    do_sample: true,
-                    return_full_text: false    // Only return new text
-                }
+                parameters: parameters
             },
             {
                 headers: {
                     'Authorization': `Bearer ${HUGGING_FACE_API_KEY}`,
                     'Content-Type': 'application/json'
                 },
-                timeout: 60000 // 60 seconds - increased for larger model
+                timeout: 30000 + (attemptNumber * 10000) // Increase timeout with each retry
             }
         );
 
-        console.log('Received successful response from Hugging Face API');
+        console.log(`Received successful response from model ${modelName}`);
         console.log('Response preview:',
             JSON.stringify(response.data).substring(0, 150) + '...');
 
         modelLoadingInProgress = false;
         modelSuccessfullyLoaded = true;
+        consecutiveFailures = 0; // Reset failure counter on success
 
         // Parse the response based on its format
         let rawResponse = '';
 
-        console.log('Response data type:', typeof response.data);
-        if (typeof response.data === 'object') {
-            console.log('Response data keys:', Object.keys(response.data));
-        }
-
         if (Array.isArray(response.data)) {
-            console.log('Response is an array of length:', response.data.length);
             if (response.data.length > 0) {
                 rawResponse = response.data[0].generated_text || '';
             }
@@ -154,70 +221,75 @@ async function callHuggingFaceAPI(inputs) {
             rawResponse = JSON.stringify(response.data);
         }
 
-        // Now extract the actual response text
-        const generatedText = extractModelResponse(rawResponse);
-
-        console.log('Extracted response:', generatedText.substring(0, 100) + '...');
+        // Extract the actual response text
+        const generatedText = extractModelResponse(rawResponse, modelName);
 
         // Return in consistent format
-        return { generated_text: generatedText };
+        return {
+            generated_text: generatedText,
+            model_used: modelName
+        };
     } catch (error) {
         // Enhanced error logging
-        console.error('Hugging Face API Error Details:', {
+        console.error(`Error with model ${modelName}:`, {
             message: error.message,
             code: error.code,
             status: error.response?.status,
-            statusText: error.response?.statusText,
-            data: error.response?.data,
+            statusText: error.response?.statusText
         });
 
-        // Handle model loading errors
-        if (error.response && error.response.data &&
-            error.response.data.error &&
-            (error.response.data.error.includes('loading') ||
-                error.response.data.error.includes('currently loading'))) {
+        consecutiveFailures++;
 
-            console.log(`Model ${MODEL_NAME} loading in progress at Hugging Face`);
+        // Handle model loading errors
+        if (error.response?.status === 503 ||
+            (error.response?.data?.error && error.response.data.error.includes('loading'))) {
+
+            console.log(`Model ${modelName} unavailable or loading`);
             modelLoadingInProgress = true;
             lastModelLoadAttempt = Date.now();
-            throw { code: 'MODEL_LOADING', message: error.response.data.error };
+
+            // If we've had too many failures with this model, try the next one
+            if (consecutiveFailures > 2) {
+                console.log(`Switching to next model after ${consecutiveFailures} failures`);
+                return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
+            }
+
+            // If this is not the first attempt, wait with exponential backoff
+            if (attemptNumber > 0) {
+                await wait(attemptNumber);
+            }
+
+            // Retry with the same model (up to 3 times per model)
+            if (attemptNumber < 2) {
+                return callHuggingFaceAPI(inputs, attemptNumber + 1, modelIndex);
+            } else {
+                // After 3 attempts, try the next model
+                return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
+            }
         }
 
-        // Handle 424 Failed Dependency errors (what you were seeing)
-        if (error.response && error.response.status === 424) {
-            console.log('Received 424 Failed Dependency error - likely input formatting issue');
-            throw {
-                code: 'INPUT_ERROR',
-                message: 'There was an issue processing your request. Try a simpler question.'
-            };
+        // Special handling for timeouts
+        if (error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
+            console.log(`Timeout with model ${modelName}`);
+
+            // Try the next model immediately on timeout
+            return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
         }
 
-        // Special handling for timeouts with clear error code
-        if (error.code === 'ECONNABORTED') {
-            throw {
-                code: 'TIMEOUT',
-                message: 'Request to AI model timed out. Try a shorter message or try again later.'
-            };
-        }
-
-        // For any other error, rethrow with additional context
-        throw error;
+        // For any other error, try the next model
+        console.log(`Unhandled error with model ${modelName}, trying next model`);
+        return callHuggingFaceAPI(inputs, 0, modelIndex + 1);
     }
 }
 
 // Apply rate limiter to the API endpoint
 app.post('/api/huggingface', rateLimiter, async (req, res) => {
     try {
-        console.log('Received request to /api/huggingface', {
-            contentType: req.headers['content-type'],
-            bodySize: JSON.stringify(req.body).length,
-            hasInputs: !!req.body.inputs
-        });
+        console.log('Received request to /api/huggingface');
 
         const { inputs } = req.body;
 
         if (!inputs) {
-            console.log('Missing inputs field in request body', req.body);
             return res.status(400).json({
                 error: 'Bad Request',
                 message: 'The "inputs" field is required'
@@ -225,94 +297,27 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         }
 
         // Check input length to avoid token limit issues
-        if (inputs.length > 2000) { // Reduced from 2500 to improve reliability
+        if (inputs.length > 2000) {
             return res.status(400).json({
                 error: 'Input too long',
                 message: 'The input text exceeds the maximum allowed length'
             });
         }
 
-        // Check if we need to wait because a model loading is in progress
-        const now = Date.now();
-        if (modelLoadingInProgress && (now - lastModelLoadAttempt) < 15000) {
-            return res.status(503).json({
-                error: 'Model loading in progress',
-                message: `The AI model ${MODEL_NAME} is currently loading. Please try again in a moment.`,
+        // Make the actual request to Hugging Face API with fallback support
+        try {
+            const data = await callHuggingFaceAPI(inputs);
+            res.json(data);
+        } catch (apiError) {
+            console.log('All models failed:', apiError.message);
+
+            // If all models failed, return a clear error
+            res.status(503).json({
+                error: 'Service Unavailable',
+                message: 'All AI models are currently unavailable. Please try again later.',
                 retry: true
             });
         }
-
-        // Reset the model loading flag if it's been a while since the last attempt
-        if (modelLoadingInProgress && (now - lastModelLoadAttempt) >= 15000) {
-            modelLoadingInProgress = false;
-        }
-
-        // If the model has never been successfully loaded, we might need a "warm-up" call
-        if (!modelSuccessfullyLoaded) {
-            try {
-                // Make a simple warming request to load the model
-                console.log('Attempting model warm-up');
-                await callHuggingFaceAPI('You are Dermi, a dermatology assistant. Keep responses brief.');
-                console.log('Model warm-up successful');
-            } catch (warmupError) {
-                console.error('Warm-up error:', warmupError);
-                // If it's a loading error, we can continue with the actual request
-                if (warmupError.code !== 'MODEL_LOADING') {
-                    throw warmupError;
-                }
-            }
-        }
-
-        // Make the actual request to Hugging Face API
-        try {
-            const data = await callHuggingFaceAPI(inputs);
-
-            // Ensure we're sending a consistent response format for the frontend
-            if (typeof data === 'string') {
-                // If the response is a string, wrap it in an object
-                res.json({ generated_text: data });
-            } else {
-                // Otherwise, just send the object as is
-                res.json(data);
-            }
-        } catch (apiError) {
-            console.log('API Error caught:', apiError.code, apiError.message);
-
-            if (apiError.code === 'MODEL_LOADING') {
-                return res.status(503).json({
-                    error: 'Model loading',
-                    message: `The AI model ${MODEL_NAME} is still warming up. Please try again in a moment.`,
-                    retry: true
-                });
-            }
-
-            if (apiError.code === 'INPUT_ERROR') {
-                return res.status(400).json({
-                    error: 'Input processing error',
-                    message: apiError.message,
-                    retry: true
-                });
-            }
-
-            // Handle timeouts specifically
-            if (apiError.code === 'TIMEOUT' || apiError.code === 'ECONNABORTED') {
-                return res.status(504).json({
-                    error: 'Gateway Timeout',
-                    message: 'The request to the AI model timed out. Please try again with a shorter message.',
-                    retry: true
-                });
-            }
-
-            // For any other error, return appropriate status code and error details
-            const statusCode = apiError.response?.status || 500;
-            res.status(statusCode).json({
-                error: 'Failed to process request',
-                message: apiError.message || 'An unexpected error occurred',
-                details: apiError.response?.data || null,
-                retry: true // Add retry flag to encourage client to retry
-            });
-        }
-
     } catch (error) {
         console.error('Unhandled error:', error);
 
@@ -320,8 +325,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         res.status(500).json({
             error: 'Failed to process request',
             message: error.message || 'An unexpected error occurred',
-            stack: process.env.NODE_ENV === 'development' ? error.stack : undefined,
-            retry: true // Add retry flag to encourage client to retry
+            retry: true
         });
     }
 });
@@ -329,22 +333,28 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 // Add a pre-warming endpoint that can be called by a scheduler
 app.get('/api/warmup', async (req, res) => {
     try {
-        await callHuggingFaceAPI('You are Dermi, a friendly dermatology assistant. Provide brief, helpful answers about skin health.');
-        res.json({ status: 'success', message: `Model ${MODEL_NAME} warmed up successfully` });
+        const result = await callHuggingFaceAPI('You are Dermi, a friendly dermatology assistant. Provide brief, helpful answers about skin health.');
+        res.json({
+            status: 'success',
+            message: `Model ${result.model_used} warmed up successfully`
+        });
     } catch (error) {
-        if (error.code === 'MODEL_LOADING') {
-            res.status(202).json({
-                status: 'pending',
-                message: `Model ${MODEL_NAME} is loading, warm-up request acknowledged`
-            });
-        } else {
-            res.status(500).json({
-                status: 'error',
-                message: 'Failed to warm up model',
-                error: error.message
-            });
-        }
+        res.status(500).json({
+            status: 'error',
+            message: 'Failed to warm up all models',
+            error: error.message
+        });
     }
+});
+
+// Add a status endpoint to check which model is currently active
+app.get('/api/status', (req, res) => {
+    res.json({
+        status: 'online',
+        current_model: CURRENT_MODEL,
+        model_loaded: modelSuccessfullyLoaded,
+        consecutive_failures: consecutiveFailures
+    });
 });
 
 // Periodically clean up the rate limiter data
@@ -359,23 +369,18 @@ setInterval(() => {
 
 app.listen(PORT, () => {
     console.log(`Proxy server running on port ${PORT}`);
-    console.log(`Using model: ${MODEL_NAME}`);
+    console.log(`Starting with model: ${CURRENT_MODEL}`);
 
-    // Try warming up the model on startup with multiple retries
+    // Try warming up the model on startup
     setTimeout(async () => {
         console.log('Attempting initial model warm-up');
-        // Try up to 3 times with increasing delays
-        for (let i = 0; i < 3; i++) {
-            try {
-                await callHuggingFaceAPI('You are Dermi, a dermatology assistant. Your job is to provide helpful information about skin health and the Dermi app. Keep responses brief and professional.');
-                console.log(`Initial model ${MODEL_NAME} warm-up successful!`);
-                break; // Exit loop on success
-            } catch (error) {
-                console.log(`Warm-up attempt ${i+1} failed, waiting before retrying...`);
-                if (i < 2) { // Don't wait after the last attempt
-                    await new Promise(resolve => setTimeout(resolve, 5000 * (i+1))); // Increasing wait
-                }
-            }
+        try {
+            const result = await callHuggingFaceAPI(
+                'You are Dermi, a dermatology assistant. Your job is to provide helpful information about skin health and the Dermi app. Keep responses brief and professional.'
+            );
+            console.log(`Initial model ${result.model_used} warm-up successful!`);
+        } catch (error) {
+            console.error('All warm-up attempts failed:', error.message);
         }
     }, 2000); // Wait 2 seconds after startup before warming up
 });
