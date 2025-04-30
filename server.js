@@ -77,38 +77,105 @@ function rateLimiter(req, res, next) {
     next();
 }
 
-// Format prompt based on model type
+// IMPROVED: Better prompt formatting based on model type
 function formatPrompt(inputs, modelName) {
-    // Different models may require different prompting formats
+    // First, try to extract just the user's question when possible
+    let userQuestion = "";
+    const userMatch = inputs.match(/User:\s*(.*?)(\n|$)/);
+    if (userMatch && userMatch[1]) {
+        userQuestion = userMatch[1].trim();
+    }
+
+    // If we couldn't extract it, use the full input
+    if (!userQuestion) {
+        userQuestion = inputs;
+    }
+
+    // Extract system instructions if present (for context)
+    let systemInstructions = "";
+    if (inputs.includes("You are Dermi")) {
+        const systemMatch = inputs.match(/You are Dermi.*?(?=\n\n|$)/s);
+        if (systemMatch) {
+            systemInstructions = systemMatch[0];
+        }
+    }
+
+    // Format differently based on model type
     if (modelName.includes('phi-2')) {
-        // Microsoft phi-2 uses a simple User/Assistant format
-        return `User: ${inputs}\nAssistant:`;
+        // For phi-2, use a structured prompt format
+        return `<INST>You are Dermi, a friendly dermatology AI assistant. 
+Always respond about skin health topics concisely.
+Never say you can diagnose conditions - always recommend seeing a doctor.
+
+${userQuestion}</INST>`;
     } else if (modelName.includes('flan-t5')) {
         // T5 models work well with task prefixes
-        return `Answer this medical question: ${inputs}`;
+        return `Answer this dermatology question concisely as a helpful skin health assistant: ${userQuestion}`;
     } else if (modelName.includes('opt')) {
-        // OPT models work with simple prompts
-        return `Q: ${inputs}\nA:`;
+        // OPT models work with simple prompts but need clear instruction
+        return `Q: ${userQuestion}\nA: [As a skin health assistant, remember to never claim you can diagnose and keep your answer brief]`;
     } else {
         // Default format
-        return inputs;
+        return `You are Dermi, a skin health assistant. Answer this question briefly: ${userQuestion}`;
     }
 }
 
-// Extract response from model format
+// IMPROVED: Better response extraction
 function extractModelResponse(response, modelName) {
-    // Handle different model output formats
+    // First, clean up any wrapper text
     let cleanedResponse = response;
 
+    // Handle different model output formats
     if (modelName.includes('phi-2')) {
         // Clean up phi-2 responses
         cleanedResponse = cleanedResponse.replace(/\nUser:.*$/s, '');
         cleanedResponse = cleanedResponse.replace(/^Assistant:\s*/i, '');
         cleanedResponse = cleanedResponse.replace(/^Dermi:\s*/i, '');
+        cleanedResponse = cleanedResponse.replace(/<\/?INST>/, '');
     } else if (modelName.includes('flan-t5') || modelName.includes('opt')) {
         // These models typically return just the answer
-        cleanedResponse = cleanedResponse.replace(/^A:\s*/i, '');
+        cleanedResponse = cleanedResponse.replace(/^A:\s*(\[.*?\]\s*)?/i, '');
         cleanedResponse = cleanedResponse.replace(/^Q:.*$/gm, ''); // Remove question reflections
+    }
+
+    // Further clean up any system instructions that might have leaked
+    const systemMarkers = [
+        "You are Dermi",
+        "friendly dermatology AI",
+        "ABCDE rule",
+        "skin health assistant",
+        "never claim you can diagnose",
+        "keep your answer brief"
+    ];
+
+    // Go through and remove any lines containing system instructions
+    const lines = cleanedResponse.split('\n');
+    const filteredLines = lines.filter(line => {
+        // Keep the line if it doesn't contain any system markers
+        return !systemMarkers.some(marker =>
+            line.toLowerCase().includes(marker.toLowerCase())
+        );
+    });
+
+    cleanedResponse = filteredLines.join('\n').trim();
+
+    // If we still have system instructions, try a more aggressive approach
+    // by finding the start of the actual response
+    if (cleanedResponse.includes("dermatology") &&
+        (cleanedResponse.includes("assistant") || cleanedResponse.includes("ABCDE"))) {
+
+        const possibleStartPatterns = [
+            "Hi", "Hello", "I'd", "I can", "Welcome", "The Dermi app",
+            "This app", "No,", "Yes,", "I'm", "To use"
+        ];
+
+        for (const pattern of possibleStartPatterns) {
+            const index = cleanedResponse.indexOf(pattern);
+            if (index > 0) {
+                cleanedResponse = cleanedResponse.substring(index);
+                break;
+            }
+        }
     }
 
     return cleanedResponse.trim();
@@ -127,7 +194,7 @@ async function wait(attemptNumber) {
 function getModelParameters(modelName) {
     if (modelName.includes('phi-2')) {
         return {
-            max_new_tokens: 250,
+            max_new_tokens: 150,
             temperature: 0.5,
             top_p: 0.95,
             do_sample: true,
@@ -135,7 +202,7 @@ function getModelParameters(modelName) {
         };
     } else if (modelName.includes('flan-t5')) {
         return {
-            max_new_tokens: 150,
+            max_new_tokens: 120,
             temperature: 0.7,
             top_p: 0.9,
             do_sample: true
@@ -209,7 +276,7 @@ async function attemptServiceRecovery() {
     return false;
 }
 
-// Hugging Face API calling function with better error handling and fallback
+// IMPROVED: Hugging Face API calling function with better error handling and fallback
 async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
     const HUGGING_FACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
 
@@ -256,7 +323,6 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         modelLoadingInProgress = false;
         modelSuccessfullyLoaded = true;
         consecutiveFailures = 0; // Reset failure counter on success
-
         // Parse the response based on its format
         let rawResponse = '';
 
@@ -440,7 +506,7 @@ app.listen(PORT, () => {
         console.log('Attempting initial model warm-up');
         try {
             const result = await callHuggingFaceAPI(
-                'You are Dermi, a dermatology assistant. Your job is to provide helpful information about skin health and the Dermi app. Keep responses brief and professional.'
+                'You are Dermi, an AI dermatology assistant on the Dermi skin health scanning app. Your job is to provide helpful information about skin health and the Dermi app. Keep responses brief and professional.'
             );
             console.log(`Initial model ${result.model_used} warm-up successful!`);
         } catch (error) {
