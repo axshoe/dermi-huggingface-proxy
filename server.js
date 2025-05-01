@@ -27,15 +27,15 @@ let modelSuccessfullyLoaded = false;
 let consecutiveFailures = 0;
 const MAX_CONSECUTIVE_FAILURES = 5;
 let serviceRecoveryAttempts = 0;
-let CURRENT_MODEL = process.env.PRIMARY_MODEL || 'facebook/opt-350m';
+let CURRENT_MODEL = process.env.PRIMARY_MODEL || 'mistralai/Mistral-7B-Instruct-v0.1';
 
-// Define models in order of preference - prioritizing reliable models first
+// Define models in order of preference - prioritizing more capable models first
 const MODELS = [
-    'facebook/opt-350m',         // Primary choice - very small but very reliable
-    'google/flan-t5-small',      // Fallback #1 - smaller but reliable
-    'microsoft/phi-2',           // Fallback #2 - 2.7B parameter model but less reliable
-    'mistralai/Mistral-7B-Instruct-v0.1',
-    'distilbert/distilbert-base-uncased' // Last resort - not ideal for generation but should work
+    'mistralai/Mistral-7B-Instruct-v0.1', // Primary choice - good at instruction following
+    'microsoft/phi-2',                     // Fallback #1 - 2.7B parameter model but reliable
+    'facebook/opt-1.3b',                   // Fallback #2 - slightly larger OPT model
+    'facebook/opt-350m',                   // Fallback #3 - small but reliable
+    'google/flan-t5-small'                 // Last resort - smaller but reliable
 ];
 
 // Implement a basic rate limiter
@@ -80,111 +80,117 @@ function rateLimiter(req, res, next) {
 
 // IMPROVED: Better prompt formatting based on model type
 function formatPrompt(inputs, modelName) {
-    // First, try to extract just the user's question when possible
+    // Extract the user's question when possible
     let userQuestion = "";
     const userMatch = inputs.match(/User:\s*(.*?)(\n|$)/);
     if (userMatch && userMatch[1]) {
         userQuestion = userMatch[1].trim();
-    }
-
-    // If we couldn't extract it, use the full input
-    if (!userQuestion) {
-        userQuestion = inputs;
-    }
-
-    // Extract system instructions if present (for context)
-    let systemInstructions = "";
-    if (inputs.includes("You are Dermi")) {
-        const systemMatch = inputs.match(/You are Dermi.*?(?=\n\n|$)/s);
-        if (systemMatch) {
-            systemInstructions = systemMatch[0];
-        }
-    }
-
-    // Format differently based on model type
-    if (modelName.includes('phi-2')) {
-        // For phi-2, use a structured prompt format
-        return `<INST>You are Dermi, a friendly dermatology AI assistant. 
-Always respond about skin health topics concisely.
-Never say you can diagnose conditions - always recommend seeing a doctor.
-
-${userQuestion}</INST>`;
-    } else if (modelName.includes('flan-t5')) {
-        // T5 models work well with task prefixes
-        return `Answer this dermatology question concisely as a helpful skin health assistant: ${userQuestion}`;
-    } else if (modelName.includes('opt')) {
-        // OPT models work with simple prompts but need clear instruction
-        return `Q: ${userQuestion}\nA: [As a skin health assistant, remember to never claim you can diagnose and keep your answer brief]`;
     } else {
-        // Default format
-        return `You are Dermi, a skin health assistant. Answer this question briefly: ${userQuestion}`;
-    }
-}
-
-// IMPROVED: Better response extraction
-function extractModelResponse(response, modelName) {
-    // First, clean up any wrapper text
-    let cleanedResponse = response;
-
-    // Handle different model output formats
-    if (modelName.includes('phi-2')) {
-        // Clean up phi-2 responses
-        cleanedResponse = cleanedResponse.replace(/\nUser:.*$/s, '');
-        cleanedResponse = cleanedResponse.replace(/^Assistant:\s*/i, '');
-        cleanedResponse = cleanedResponse.replace(/^Dermi:\s*/i, '');
-        cleanedResponse = cleanedResponse.replace(/<\/?INST>/, '');
-    } else if (modelName.includes('flan-t5') || modelName.includes('opt')) {
-        // These models typically return just the answer
-        cleanedResponse = cleanedResponse.replace(/^A:\s*(\[.*?\]\s*)?/i, '');
-        cleanedResponse = cleanedResponse.replace(/^Q:.*$/gm, ''); // Remove question reflections
-    }
-
-    // Further clean up any system instructions that might have leaked
-    const systemMarkers = [
-        "You are Dermi",
-        "friendly dermatology AI",
-        "ABCDE rule",
-        "skin health assistant",
-        "never claim you can diagnose",
-        "keep your answer brief"
-    ];
-
-    // Go through and remove any lines containing system instructions
-    const lines = cleanedResponse.split('\n');
-    const filteredLines = lines.filter(line => {
-        // Keep the line if it doesn't contain any system markers
-        return !systemMarkers.some(marker =>
-            line.toLowerCase().includes(marker.toLowerCase())
-        );
-    });
-
-    cleanedResponse = filteredLines.join('\n').trim();
-
-    // If we still have system instructions, try a more aggressive approach
-    // by finding the start of the actual response
-    if (cleanedResponse.includes("dermatology") &&
-        (cleanedResponse.includes("assistant") || cleanedResponse.includes("ABCDE"))) {
-
-        const possibleStartPatterns = [
-            "Hi", "Hello", "I'd", "I can", "Welcome", "The Dermi app",
-            "This app", "No,", "Yes,", "I'm", "To use"
-        ];
-
-        for (const pattern of possibleStartPatterns) {
-            const index = cleanedResponse.indexOf(pattern);
-            if (index > 0) {
-                cleanedResponse = cleanedResponse.substring(index);
+        // Try to get the last line if there's no User: prefix
+        const lines = inputs.split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+            if (lines[i].trim() && !lines[i].includes('Assistant:') && !lines[i].includes('Dermi:')) {
+                userQuestion = lines[i].trim();
                 break;
             }
         }
     }
 
-    return cleanedResponse.trim();
+    // If we still couldn't extract it, use the full input
+    if (!userQuestion) {
+        userQuestion = inputs;
+    }
+
+    // Format differently based on model type
+    if (modelName.includes('mistral')) {
+        // For Mistral, use chat format
+        return `<s>[INST] 
+You are Dermi, a friendly skin health assistant in a dermatology app.
+Guidelines:
+1. Only discuss skin health topics
+2. Never diagnose - always recommend seeing a doctor
+3. Keep answers brief and helpful (2-4 sentences)
+4. Provide accurate medical information
+
+User question: ${userQuestion} [/INST]</s>`;
+    } else if (modelName.includes('phi-2')) {
+        // For phi-2, use a structured prompt format
+        return `<|USER|>You are Dermi, a friendly dermatology AI assistant.
+Answer this question about skin health: ${userQuestion}<|ASSISTANT|>`;
+    } else if (modelName.includes('flan-t5')) {
+        // T5 models work well with task prefixes
+        return `Answer this dermatology question concisely as a helpful skin health assistant: ${userQuestion}`;
+    } else if (modelName.includes('opt')) {
+        // OPT models work with simple prompts but need clear instruction
+        return `Human: ${userQuestion}\n\nDermi (a dermatology assistant):`;
+    } else {
+        // Default format
+        return `Q: ${userQuestion}\nA:`;
+    }
+}
+
+// IMPROVED: Better response extraction with less aggressive filtering
+function extractModelResponse(response, modelName) {
+    // First check if we received anything
+    if (!response || response.length < 1) {
+        return "I apologize, but I couldn't generate a proper response. Could you try asking your question differently?";
+    }
+
+    // Handle different model output formats
+    let cleanedResponse = response;
+
+    console.log("Raw model response:", response.substring(0, 150));
+
+    if (modelName.includes('mistral')) {
+        // Clean up Mistral responses
+        cleanedResponse = cleanedResponse.replace(/<\/?s>/g, '');
+        cleanedResponse = cleanedResponse.replace(/\[INST\].*?\[\/INST\]/s, '');
+    } else if (modelName.includes('phi-2')) {
+        // Clean up phi-2 responses
+        cleanedResponse = cleanedResponse.replace(/<\|USER\|>.*?<\|ASSISTANT\|>/s, '');
+        cleanedResponse = cleanedResponse.replace(/<\|.*?\|>/g, '');
+    } else if (modelName.includes('flan-t5')) {
+        // Clean up flan-t5 responses
+        // T5 typically doesn't need much cleaning
+    } else if (modelName.includes('opt')) {
+        // Clean up OPT responses
+        cleanedResponse = cleanedResponse.replace(/^Human:.*?\n\nDermi.*?:/s, '');
+        cleanedResponse = cleanedResponse.replace(/^Human:.*$/gm, '');
+    }
+
+    // Generic cleaning for all models
+    cleanedResponse = cleanedResponse.replace(/^(Assistant|Dermi|A):\s*/i, '');
+    cleanedResponse = cleanedResponse.replace(/^Q:.*$/gm, '');
+
+    // Remove any remaining system prompts or instructions
+    // Note: Be less aggressive with filtering to avoid removing content
+    const systemInstructionPhrases = [
+        "You are Dermi, a dermatology assistant",
+        "You are a dermatology assistant",
+        "I am Dermi, a dermatology assistant",
+        "never claim you can diagnose",
+        "never diagnose - always recommend seeing a doctor",
+        "keep answers brief"
+    ];
+
+    // Only remove complete system instructions, not parts of valid responses
+    for (const phrase of systemInstructionPhrases) {
+        cleanedResponse = cleanedResponse.replace(new RegExp(phrase, 'i'), '');
+    }
+
+    cleanedResponse = cleanedResponse.trim();
+
+    // If we have an empty response after cleaning, provide a fallback
+    if (!cleanedResponse || cleanedResponse.length < 10) {
+        return "I'm here to help with your skin health questions. Could you provide more details about your question?";
+    }
+
+    return cleanedResponse;
 }
 
 // Improved exponential backoff for retries
 async function wait(attemptNumber) {
-    const baseDelay = 2000; // 2 seconds (increased from 1)
+    const baseDelay = 2000; // 2 seconds
     const maxDelay = 30000; // 30 seconds
     const delay = Math.min(baseDelay * Math.pow(2, attemptNumber), maxDelay);
     console.log(`Waiting ${delay}ms before retry`);
@@ -193,11 +199,19 @@ async function wait(attemptNumber) {
 
 // Get model parameters based on model name
 function getModelParameters(modelName) {
-    if (modelName.includes('phi-2')) {
+    if (modelName.includes('mistral')) {
         return {
             max_new_tokens: 150,
-            temperature: 0.5,
+            temperature: 0.7,
             top_p: 0.95,
+            do_sample: true,
+            return_full_text: false
+        };
+    } else if (modelName.includes('phi-2')) {
+        return {
+            max_new_tokens: 150,
+            temperature: 0.6,
+            top_p: 0.92,
             do_sample: true,
             return_full_text: false
         };
@@ -211,7 +225,7 @@ function getModelParameters(modelName) {
     } else if (modelName.includes('opt')) {
         return {
             max_new_tokens: 100,
-            temperature: 0.6,
+            temperature: 0.7,
             top_p: 0.9,
             do_sample: true,
             return_full_text: false
@@ -302,6 +316,8 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         const formattedInput = formatPrompt(inputs, modelName);
         const parameters = getModelParameters(modelName);
 
+        console.log(`Formatted prompt for ${modelName}: ${formattedInput.substring(0, 100)}...`);
+
         const response = await axios.post(
             `https://api-inference.huggingface.co/models/${modelName}`,
             {
@@ -324,6 +340,7 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         modelLoadingInProgress = false;
         modelSuccessfullyLoaded = true;
         consecutiveFailures = 0; // Reset failure counter on success
+
         // Parse the response based on its format
         let rawResponse = '';
 
@@ -346,7 +363,8 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         const generatedText = extractModelResponse(rawResponse, modelName);
 
         // Check if response is too short and provide a better response
-        if (generatedText.length < 20) {
+        if (generatedText.length < 15) {
+            console.log("Response too short, returning default response");
             return {
                 generated_text: "I'm here to help with skin health questions. Could you please ask about a specific skin condition or how to use the Dermi app?",
                 model_used: modelName
@@ -387,7 +405,7 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
             await wait(attemptNumber + 1);
 
             // Try more times before switching models
-            if (attemptNumber < 3) {
+            if (attemptNumber < 2) {
                 return callHuggingFaceAPI(inputs, attemptNumber + 1, modelIndex);
             } else {
                 // After multiple attempts, try the next model
@@ -436,13 +454,14 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         // Make the actual request to Hugging Face API with fallback support
         try {
             const data = await callHuggingFaceAPI(inputs);
+            console.log('Final response sent to client:', data.generated_text.substring(0, 150));
             res.json(data);
         } catch (apiError) {
             console.log('All models failed:', apiError.message);
 
             // If all models failed, return a default response instead of error
             res.json({
-                generated_text: "I'm having trouble connecting to my knowledge base, but I'm here to help with skin health questions. Could you try again in a few moments?",
+                generated_text: "I'm having trouble connecting to my knowledge base, but I'm here to help with skin health questions. Could you try asking in a different way?",
                 model_used: "fallback_response"
             });
 
@@ -464,7 +483,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 // Add a pre-warming endpoint that can be called by a scheduler
 app.get('/api/warmup', async (req, res) => {
     try {
-        const result = await callHuggingFaceAPI('You are Dermi, a friendly dermatology assistant. Provide brief, helpful answers about skin health.');
+        const result = await callHuggingFaceAPI('You are Dermi, a friendly dermatology assistant. What can you tell me about sunscreen?');
         res.json({
             status: 'success',
             message: `Model ${result.model_used} warmed up successfully`
@@ -488,6 +507,35 @@ app.get('/api/status', (req, res) => {
     });
 });
 
+// Debug endpoint to test a specific prompt directly
+app.post('/api/debug', async (req, res) => {
+    try {
+        const { inputs, model_name } = req.body;
+
+        if (!inputs) {
+            return res.status(400).json({ error: 'Inputs are required' });
+        }
+
+        // Allow specifying a model for testing
+        let modelIndex = 0;
+        if (model_name) {
+            modelIndex = MODELS.findIndex(m => m.includes(model_name));
+            if (modelIndex === -1) modelIndex = 0; // Default to first if not found
+        }
+
+        const result = await callHuggingFaceAPI(inputs, 0, modelIndex);
+        res.json({
+            ...result,
+            prompt_used: formatPrompt(inputs, result.model_used)
+        });
+    } catch (error) {
+        res.status(500).json({
+            error: 'Debug request failed',
+            message: error.message
+        });
+    }
+});
+
 // Periodically clean up the rate limiter data
 setInterval(() => {
     const now = Date.now();
@@ -507,7 +555,7 @@ app.listen(PORT, () => {
         console.log('Attempting initial model warm-up');
         try {
             const result = await callHuggingFaceAPI(
-                'You are Dermi, an AI dermatology assistant on the Dermi skin health scanning app. Your job is to provide helpful information about skin health and the Dermi app. Keep responses brief and professional.'
+                'What can you tell me about sun exposure and skin health?'
             );
             console.log(`Initial model ${result.model_used} warm-up successful!`);
         } catch (error) {
