@@ -34,6 +34,7 @@ const MODELS = [
     'facebook/opt-350m',         // Primary choice - very small but very reliable
     'google/flan-t5-small',      // Fallback #1 - smaller but reliable
     'microsoft/phi-2',           // Fallback #2 - 2.7B parameter model but less reliable
+    'mistralai/Mistral-7B-Instruct-v0.1',
     'distilbert/distilbert-base-uncased' // Last resort - not ideal for generation but should work
 ];
 
