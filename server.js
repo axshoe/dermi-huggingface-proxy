@@ -6,6 +6,24 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Message keys for internationalization
+const MESSAGE_KEYS = {
+    // Error message keys
+    RATE_LIMIT_EXCEEDED: 'RATE_LIMIT_EXCEEDED',
+    INPUT_REQUIRED: 'INPUT_REQUIRED',
+    INPUT_TOO_LONG: 'INPUT_TOO_LONG',
+    SERVER_ERROR: 'SERVER_ERROR',
+    API_KEY_MISSING: 'API_KEY_MISSING',
+    ALL_MODELS_FAILED: 'ALL_MODELS_FAILED',
+
+    // Default response keys
+    EMPTY_RESPONSE_FALLBACK: 'EMPTY_RESPONSE_FALLBACK',
+    CONNECTION_TROUBLE: 'CONNECTION_TROUBLE',
+    ASK_DIFFERENTLY: 'ASK_DIFFERENTLY',
+    HELP_WITH_SKIN: 'HELP_WITH_SKIN',
+    HELP_WITH_SKIN_SPECIFIC: 'HELP_WITH_SKIN_SPECIFIC'
+};
+
 // Enable CORS for all routes
 app.use(cors());
 
@@ -31,11 +49,11 @@ let CURRENT_MODEL = process.env.PRIMARY_MODEL || 'mistralai/Mistral-7B-Instruct-
 
 // Define models in order of preference - prioritizing more capable models first
 const MODELS = [
-    'mistralai/Mistral-7B-Instruct-v0.1', // Primary choice - good at instruction following
-    'microsoft/phi-2',                     // Fallback #1 - 2.7B parameter model but reliable
     'facebook/opt-1.3b',                   // Fallback #2 - slightly larger OPT model
     'facebook/opt-350m',                   // Fallback #3 - small but reliable
-    'google/flan-t5-small'                 // Last resort - smaller but reliable
+    'google/flan-t5-small',                // Last resort - smaller but reliable
+    'mistralai/Mistral-7B-Instruct-v0.1',
+    'distilbert/distilbert-base-uncased' // Last resort - not ideal for generation but should work
 ];
 
 // Implement a basic rate limiter
@@ -71,7 +89,8 @@ function rateLimiter(req, res, next) {
     if (requestCounts[ip].count > RATE_LIMIT) {
         return res.status(429).json({
             error: 'Rate limit exceeded',
-            message: 'Too many requests. Please try again later.'
+            messageKey: MESSAGE_KEYS.RATE_LIMIT_EXCEEDED,
+            fallbackMessage: 'Too many requests. Please try again later.'
         });
     }
 
@@ -129,11 +148,14 @@ Answer this question about skin health: ${userQuestion}<|ASSISTANT|>`;
     }
 }
 
-// IMPROVED: Better response extraction with less aggressive filtering
+// IMPROVED: Better response extraction with message keys for fallbacks
 function extractModelResponse(response, modelName) {
     // First check if we received anything
     if (!response || response.length < 1) {
-        return "I apologize, but I couldn't generate a proper response. Could you try asking your question differently?";
+        return {
+            messageKey: MESSAGE_KEYS.ASK_DIFFERENTLY,
+            fallbackText: "I apologize, but I couldn't generate a proper response. Could you try asking your question differently?"
+        };
     }
 
     // Handle different model output formats
@@ -180,12 +202,19 @@ function extractModelResponse(response, modelName) {
 
     cleanedResponse = cleanedResponse.trim();
 
-    // If we have an empty response after cleaning, provide a fallback
+    // If we have an empty response after cleaning, provide a fallback with message key
     if (!cleanedResponse || cleanedResponse.length < 10) {
-        return "I'm here to help with your skin health questions. Could you provide more details about your question?";
+        return {
+            messageKey: MESSAGE_KEYS.HELP_WITH_SKIN,
+            fallbackText: "I'm here to help with your skin health questions. Could you provide more details about your question?"
+        };
     }
 
-    return cleanedResponse;
+    // Return successful response (no message key needed)
+    return {
+        messageKey: null,
+        text: cleanedResponse
+    };
 }
 
 // Improved exponential backoff for retries
@@ -297,12 +326,12 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
 
     if (!HUGGING_FACE_API_KEY) {
         console.error('Missing Hugging Face API key');
-        throw new Error('Server configuration error: Missing API key');
+        throw new Error(MESSAGE_KEYS.API_KEY_MISSING);
     }
 
     // Get the model to try
     if (modelIndex >= MODELS.length) {
-        throw new Error('All models failed, unable to process request');
+        throw new Error(MESSAGE_KEYS.ALL_MODELS_FAILED);
     }
 
     const modelName = MODELS[modelIndex];
@@ -360,22 +389,37 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         }
 
         // Extract the actual response text
-        const generatedText = extractModelResponse(rawResponse, modelName);
+        const extractedResponse = extractModelResponse(rawResponse, modelName);
 
-        // Check if response is too short and provide a better response
-        if (generatedText.length < 15) {
-            console.log("Response too short, returning default response");
+        // Check if we got a message key response (fallback)
+        if (extractedResponse.messageKey) {
             return {
-                generated_text: "I'm here to help with skin health questions. Could you please ask about a specific skin condition or how to use the Dermi app?",
+                generated_text: {
+                    messageKey: extractedResponse.messageKey,
+                    fallbackText: extractedResponse.fallbackText
+                },
                 model_used: modelName
             };
         }
 
-        // Return in consistent format
+        // Check if response is too short and provide a better response
+        if (extractedResponse.text && extractedResponse.text.length < 15) {
+            console.log("Response too short, returning default response");
+            return {
+                generated_text: {
+                    messageKey: MESSAGE_KEYS.HELP_WITH_SKIN_SPECIFIC,
+                    fallbackText: "I'm here to help with skin health questions. Could you please ask about a specific skin condition or how to use the Dermi app?"
+                },
+                model_used: modelName
+            };
+        }
+
+        // Return successful response
         return {
-            generated_text: generatedText,
+            generated_text: extractedResponse.text,
             model_used: modelName
         };
+
     } catch (error) {
         // Enhanced error logging
         console.error(`Error with model ${modelName}:`, {
@@ -439,7 +483,8 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         if (!inputs) {
             return res.status(400).json({
                 error: 'Bad Request',
-                message: 'The "inputs" field is required'
+                messageKey: MESSAGE_KEYS.INPUT_REQUIRED,
+                fallbackMessage: 'The "inputs" field is required'
             });
         }
 
@@ -447,23 +492,49 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
         if (inputs.length > 2000) {
             return res.status(400).json({
                 error: 'Input too long',
-                message: 'The input text exceeds the maximum allowed length'
+                messageKey: MESSAGE_KEYS.INPUT_TOO_LONG,
+                fallbackMessage: 'The input text exceeds the maximum allowed length'
             });
         }
 
         // Make the actual request to Hugging Face API with fallback support
         try {
             const data = await callHuggingFaceAPI(inputs);
-            console.log('Final response sent to client:', data.generated_text.substring(0, 150));
-            res.json(data);
+
+            // Check if we got a message key response (fallback/error case)
+            if (data.generated_text && typeof data.generated_text === 'object' && data.generated_text.messageKey) {
+                console.log('Returning message key response:', data.generated_text.messageKey);
+                res.json({
+                    messageKey: data.generated_text.messageKey,
+                    fallbackText: data.generated_text.fallbackText,
+                    model_used: data.model_used
+                });
+            } else {
+                // Normal successful response
+                console.log('Final response sent to client:', data.generated_text.substring(0, 150));
+                res.json(data);
+            }
+
         } catch (apiError) {
             console.log('All models failed:', apiError.message);
 
-            // If all models failed, return a default response instead of error
-            res.json({
-                generated_text: "I'm having trouble connecting to my knowledge base, but I'm here to help with skin health questions. Could you try asking in a different way?",
-                model_used: "fallback_response"
-            });
+            // Check if error message is a message key
+            if (Object.values(MESSAGE_KEYS).includes(apiError.message)) {
+                res.json({
+                    messageKey: apiError.message,
+                    fallbackText: apiError.message === MESSAGE_KEYS.API_KEY_MISSING
+                        ? "Service temporarily unavailable."
+                        : "Unable to process your request right now.",
+                    model_used: "fallback_response"
+                });
+            } else {
+                // If all models failed, return a default response with message key
+                res.json({
+                    messageKey: MESSAGE_KEYS.CONNECTION_TROUBLE,
+                    fallbackText: "I'm having trouble connecting to my knowledge base, but I'm here to help with skin health questions. Could you try asking in a different way?",
+                    model_used: "fallback_response"
+                });
+            }
 
             // Try recovery in background
             attemptServiceRecovery();
@@ -471,10 +542,11 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
     } catch (error) {
         console.error('Unhandled error:', error);
 
-        // Provide detailed error response
+        // Provide detailed error response with message key
         res.status(500).json({
             error: 'Failed to process request',
-            message: error.message || 'An unexpected error occurred',
+            messageKey: MESSAGE_KEYS.SERVER_ERROR,
+            fallbackMessage: error.message || 'An unexpected error occurred',
             retry: true
         });
     }
@@ -513,7 +585,11 @@ app.post('/api/debug', async (req, res) => {
         const { inputs, model_name } = req.body;
 
         if (!inputs) {
-            return res.status(400).json({ error: 'Inputs are required' });
+            return res.status(400).json({
+                error: 'Inputs are required',
+                messageKey: MESSAGE_KEYS.INPUT_REQUIRED,
+                fallbackMessage: 'Inputs are required'
+            });
         }
 
         // Allow specifying a model for testing
@@ -531,7 +607,8 @@ app.post('/api/debug', async (req, res) => {
     } catch (error) {
         res.status(500).json({
             error: 'Debug request failed',
-            message: error.message
+            messageKey: MESSAGE_KEYS.SERVER_ERROR,
+            fallbackMessage: error.message
         });
     }
 });
