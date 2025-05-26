@@ -98,7 +98,7 @@ function rateLimiter(req, res, next) {
 }
 
 // IMPROVED: Better prompt formatting based on model type
-function formatPrompt(inputs, modelName) {
+function formatPrompt(inputs, modelName, language = 'en') {
     // Extract the user's question when possible
     let userQuestion = "";
     const userMatch = inputs.match(/User:\s*(.*?)(\n|$)/);
@@ -123,13 +123,8 @@ function formatPrompt(inputs, modelName) {
     // Format differently based on model type
     if (modelName.includes('mistral')) {
         // For Mistral, use chat format
-        return `<s>[INST] 
-You are Dermi, a friendly skin health assistant in a dermatology app.
-Guidelines:
-1. Only discuss skin health topics
-2. Never diagnose - always recommend seeing a doctor
-3. Keep answers brief and helpful (2-4 sentences)
-4. Provide accurate medical information
+        const systemPrompt = getSystemPromptForLanguage(language);
+        return `<s>[INST] ${systemPrompt}
 
 User question: ${userQuestion} [/INST]</s>`;
     } else if (modelName.includes('phi-2')) {
@@ -145,6 +140,33 @@ Answer this question about skin health: ${userQuestion}<|ASSISTANT|>`;
     } else {
         // Default format
         return `Q: ${userQuestion}\nA:`;
+    }
+}
+
+function getSystemPromptForLanguage(language) {
+    switch (language) {
+        case 'es':
+            return `Eres Dermi, un asistente amigable de salud de la piel en una aplicación de dermatología.
+Pautas:
+1. Solo discute temas de salud de la piel
+2. Nunca diagnostiques - siempre recomienda ver a un médico
+3. Mantén las respuestas breves y útiles (2-4 oraciones)
+4. Proporciona información médica precisa`;
+        case 'zh':
+            return `你是Dermi，皮肤科应用程序中的友好皮肤健康助手。
+指导原则：
+1. 只讨论皮肤健康话题
+2. 永远不要诊断 - 总是建议看医生
+3. 保持答案简洁有用（2-4句话）
+4. 提供准确的医疗信息`;
+        case 'en':
+        default:
+            return `You are Dermi, a friendly skin health assistant in a dermatology app.
+Guidelines:
+1. Only discuss skin health topics
+2. Never diagnose - always recommend seeing a doctor
+3. Keep answers brief and helpful (2-4 sentences)
+4. Provide accurate medical information`;
     }
 }
 
@@ -321,7 +343,7 @@ async function attemptServiceRecovery() {
 }
 
 // IMPROVED: Hugging Face API calling function with better error handling and fallback
-async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
+async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0, language = 'en') {
     const HUGGING_FACE_API_KEY = process.env.HUGGINGFACE_API_KEY;
 
     if (!HUGGING_FACE_API_KEY) {
@@ -342,7 +364,7 @@ async function callHuggingFaceAPI(inputs, attemptNumber = 0, modelIndex = 0) {
         console.log(`Input length: ${inputs.length} characters`);
 
         // Format the input correctly for the chosen model
-        const formattedInput = formatPrompt(inputs, modelName);
+        const formattedInput = formatPrompt(inputs, modelName, language);
         const parameters = getModelParameters(modelName);
 
         console.log(`Formatted prompt for ${modelName}: ${formattedInput.substring(0, 100)}...`);
@@ -478,7 +500,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
     try {
         console.log('Received request to /api/huggingface');
 
-        const { inputs } = req.body;
+        const { inputs, language = 'en' } = req.body;
 
         if (!inputs) {
             return res.status(400).json({
@@ -499,7 +521,7 @@ app.post('/api/huggingface', rateLimiter, async (req, res) => {
 
         // Make the actual request to Hugging Face API with fallback support
         try {
-            const data = await callHuggingFaceAPI(inputs);
+            const data = await callHuggingFaceAPI(inputs, 0, 0, language);
 
             // Check if we got a message key response (fallback/error case)
             if (data.generated_text && typeof data.generated_text === 'object' && data.generated_text.messageKey) {
